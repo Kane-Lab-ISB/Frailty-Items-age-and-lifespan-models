@@ -7,6 +7,7 @@ age_assess, age (days) at assessment of frailty
 
 sex_bin, Female, "1"; Male, "0"
 # example to get diet PCs  
+  ```r
   library(dplyr)
   diet_df = diet_factors %>% # example to get diet PC1-6
     dplyr::select(carbo, protein, fat, fiber, ash, choline, va, 
@@ -16,6 +17,7 @@ sex_bin, Female, "1"; Male, "0"
      dplyr::select(paste0("diet_PC", 1:6)) %>% #'FIAS_model_selection' and 'FIRLS_model_selection' need paste0("diet_PC", 1:6)
      distinct()  
   fi_df = cbind(FI_item_data, df_diet %>% slice(rep(1, nrow(FI_item_data)))) # this example only use one diet, change accordingly if more than one
+  ```
 # example to use FIAS_model_selection
   data_fias = sapply(1:nrow(fi_df), function(x) {
     dat_for_fias = fi_df[x, ] %>%
