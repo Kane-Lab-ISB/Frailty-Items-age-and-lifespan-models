@@ -6,7 +6,7 @@ example dataframes: diet_factors, FI_item_data
 age_assess, age (days) at assessment of frailty 
 
 sex_bin, Female, "1"; Male, "0"
-# example to get diet PCs  
+## example to get diet PCs  
   ```r
   library(dplyr)
   diet_df = diet_factors %>% # example to get diet PC1-6
@@ -18,7 +18,8 @@ sex_bin, Female, "1"; Male, "0"
      distinct()  
   fi_df = cbind(FI_item_data, df_diet %>% slice(rep(1, nrow(FI_item_data)))) # this example only use one diet, change accordingly if more than one
   ```
-# example to use FIAS_model_selection
+## example to use FIAS_model_selection
+  ```r
   data_fias = sapply(1:nrow(fi_df), function(x) {
     dat_for_fias = fi_df[x, ] %>%
       dplyr::select(age_assess, Alopecia, Loss_of_fur_colour, Loss_of_whiskers, Coat_condition, Tumours, Distended_abdomen, Kyphosis,
@@ -29,8 +30,10 @@ sex_bin, Female, "1"; Male, "0"
     strain = FI_item_data[x, ]$strain
     model = FIAS_model_selection(age, sex, strain)
     fias = predict(model, dat_for_fias[, -1])
-    return(fias)})    
-# example to use FIRLS_model_selection
+    return(fias)})
+  ``` 
+## example to use FIRLS_model_selection
+  ```r
   data_firls = sapply(1:nrow(fi_df), function(x) {
     dat_for_firls = fi_df[x, ] %>%
       dplyr::select(Alopecia, Loss_of_fur_colour, Loss_of_whiskers, Coat_condition, Tumours, Distended_abdomen, Kyphosis,
@@ -40,3 +43,4 @@ sex_bin, Female, "1"; Male, "0"
     model = FIRLS_model_selection(strain)
     firls = predict(model, dat_for_firls)
     return(firls)})
+  ```
