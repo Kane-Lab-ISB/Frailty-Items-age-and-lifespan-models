@@ -1,0 +1,815 @@
+---
+title: "Mixed-strain FI age and lifespan clocks"
+author: "Dantong Zhu"
+date: "2026-06-19"
+output:
+  html_document:
+    css: style.css
+    fig_caption: yes
+    highlight: tango
+    keep_md: yes
+    toc: yes
+    toc_float:
+      collapsed: no
+    toc_depth: 3
+    self_contained: yes
+    code_folding: hide
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      eval = TRUE)
+
+library(ggplot2)
+library(dplyr)
+library(ggfortify)
+library(ggpubr)
+library(pheatmap)
+library(tidyr)
+library(readxl)
+library(tidyverse)
+library(stringr)
+library(caret)
+library(ComplexUpset)
+library(gt)
+library(gtsummary)
+library(lme4)
+library(lmerTest)
+library(viridis)
+library(reshape2)
+library(survival)
+library(survminer)
+library(randomForest)
+library(variancePartition)
+library(doParallel)
+cl = makePSOCKcluster(16)
+registerDoParallel(cl)
+```
+
+```{r}
+ggplot2::theme_set(theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        plot.title = element_text(hjust = 0.5), text = element_text(size = 16), 
+        panel.border = element_rect(colour = "black", fill = NA, size = 1.2),
+        axis.text.y = element_text(color = "black"),
+        axis.text.x = element_text(color = "black")))
+```
+
+# 1. import data
+```{r}
+load("merged_data_061926.RData")
+## merged_dat, transfer_merged_data, val_merged_dat
+merged_dat_lifespan = merged_dat %>% filter(remain_lifespan_perc >= 0)
+transfer_merged_dat_lifespan = transfer_merged_dat %>% filter(remain_lifespan_perc >= 0)
+val_merged_dat_lifespan = val_merged_dat %>% filter(remain_lifespan_perc >= 0)
+```
+
+# 2. train/test split
+```{r}
+set.seed(2024)
+dis_merged_dat_unique = merged_dat %>%
+                  dplyr::group_by(Mouse.ID) %>%
+                  arrange(age_assess) %>%
+                  filter(row_number() == 1) %>%
+                  dplyr::ungroup() 
+train_id_index = createDataPartition(dis_merged_dat_unique$sex, p = 0.5, list = FALSE, times = 1) # change the split ratio
+train_id = dis_merged_dat_unique[train_id_index, ]$Mouse.ID
+test_id = setdiff(dis_merged_dat_unique$Mouse.ID, train_id)
+levels = c("JNIA1", "JNIA2", "JNIA3", "JNIA4", "JNIA5",
+           "N1", "J1", "J2", "J3", "J4", "J5", "H1",
+           "H2", "H3", "H4")
+train_set = merged_dat %>%
+            filter(Mouse.ID %in% train_id) 
+train_set$data_type = factor(train_set$data_type, levels = levels)
+test_set = merged_dat %>%
+            filter(Mouse.ID %in% test_id) 
+test_set$data_type = factor(test_set$data_type, levels = levels)
+```
+
+```{r}
+set.seed(2024)
+transfer_merged_dat_unique = transfer_merged_dat %>%
+                  dplyr::group_by(Mouse.ID) %>%
+                  arrange(age_assess) %>%
+                  filter(row_number() == 1) %>%
+                  dplyr::ungroup() 
+trans_train_id_index = createDataPartition(transfer_merged_dat_unique$sex, p = 0.5, list = FALSE, times = 1) # change the split ratio
+trans_train_id = transfer_merged_dat_unique[trans_train_id_index, ]$Mouse.ID
+trans_test_id = setdiff(transfer_merged_dat_unique$Mouse.ID, trans_train_id)
+
+trans_train_set = transfer_merged_dat %>%
+            filter(Mouse.ID %in% trans_train_id) 
+trans_test_set = transfer_merged_dat %>%
+            filter(Mouse.ID %in% trans_test_id) 
+```
+
+```{r}
+## summary
+item_names = c("Temp_score", "BW_score", all_of(colnames(JNIA_VAl1_dat)[19:47]))
+```
+
+# 3. pca analysis
+```{r}
+## fill in missingness using median. 
+## using training set median for test set
+excl_names = item_names[-c(1, 2, 5, 17, 18, 19, 24, 25, 26, 27, 28, 30)] 
+## exclusion of items variation < 5%, in combined F and M in the training set of the discovery.
+train_set_fillna = train_set %>% 
+                   dplyr::select(all_of(excl_names), sex, Time.label, data_type, FI, id, strain) %>%
+                   dplyr::group_by(data_type, Time.label, sex) %>%
+                   mutate_all(~ifelse(is.na(.) == TRUE, median(., na.rm = TRUE), .)) %>%
+                   dplyr::ungroup() %>% as.data.frame() %>%
+                   mutate(sex_bin = ifelse(sex == "F", 1, 0))
+
+train_set_keep = cbind(train_set_fillna, 
+                       train_set %>% dplyr::select(Mouse.ID, diet, carbo, protein, fat, 
+                                                   fiber, ash, choline, va, vb1, vb2, vb3, vb5, vb6, 
+                                                   vb7, vb9, vb12, vd, ve, vk, facility, age_assess, 
+                                                   time2death, age_death, lifespan_perc)) %>%
+  as.data.frame()
+
+train_medians = train_set %>%
+  dplyr::select(all_of(excl_names), data_type, Time.label, sex) %>%
+  group_by(data_type, Time.label, sex) %>%
+  summarise(across(all_of(excl_names), ~median(.x, na.rm = TRUE)), .groups = "drop")
+
+test_set_fillna = test_set %>%
+  left_join(train_medians, by = c("data_type", "Time.label", "sex"), suffix = c("", "_med")) %>%
+  mutate(across(all_of(excl_names),
+                ~ ifelse(is.na(.x), get(paste0(cur_column(), "_med")), .x))) %>%
+  mutate(sex_bin = ifelse(sex == "F", 1, 0)) %>%
+  dplyr::select(all_of(colnames(train_set_fillna)))
+
+test_set_keep = cbind(test_set_fillna, test_set %>% dplyr::select(Mouse.ID, diet, carbo, protein, fat, 
+                                                                  fiber, ash, choline, va, vb1, vb2, vb3, vb5, vb6, 
+                                                                  vb7, vb9, vb12, vd, ve, vk, facility, age_assess, 
+                                                   time2death, age_death, lifespan_perc, strain)) %>% 
+  dplyr::select(all_of(colnames(train_set_keep))) 
+
+trans_train_set_fillna = trans_train_set %>% 
+                   dplyr::select(all_of(excl_names), sex, Time.label, data_type, FI, id) %>%
+                   dplyr::group_by(data_type, Time.label, sex) %>%
+                   mutate_all(~ifelse(is.na(.) == TRUE, median(., na.rm = TRUE), .)) %>%
+                   dplyr::ungroup() %>% as.data.frame() %>%
+                   mutate(sex_bin = ifelse(sex == "F", 1, 0)) 
+
+trans_train_set_keep = cbind(trans_train_set_fillna, 
+                       trans_train_set %>% dplyr::select(Mouse.ID, diet, carbo, protein, fat, 
+                                                   fiber, ash, choline, va, vb1, vb2, vb3, vb5, vb6, 
+                                                   vb7, vb9, vb12, vd, ve, vk, facility, age_assess, 
+                                                   time2death, age_death, lifespan_perc)) %>%
+  as.data.frame()
+
+trans_train_medians = trans_train_set %>%
+  dplyr::select(all_of(excl_names), sex, Time.label, data_type, id) %>%
+  group_by(data_type, Time.label, sex) %>%
+  summarise(across(all_of(excl_names), ~median(.x, na.rm = TRUE)), .groups = "drop")
+
+trans_test_set_fillna = trans_test_set %>%
+  left_join(trans_train_medians, by = c("data_type", "Time.label", "sex"), suffix = c("", "_med")) %>%
+  mutate(across(all_of(excl_names),
+                ~ ifelse(is.na(.x), get(paste0(cur_column(), "_med")), .x))) %>%
+  mutate(sex_bin = ifelse(sex == "F", 1, 0)) %>%
+  dplyr::select(all_of(colnames(trans_train_set_fillna)))
+
+trans_test_set_keep = cbind(trans_test_set_fillna, 
+                       trans_test_set %>% dplyr::select(Mouse.ID, diet, carbo, protein, fat, 
+                                                   fiber, ash, choline, va, vb1, vb2, vb3, vb5, vb6, 
+                                                   vb7, vb9, vb12, vd, ve, vk, facility, age_assess, 
+                                                   time2death, age_death, lifespan_perc)) %>%
+  as.data.frame()
+
+val_merge_keep = val_merged_dat %>% 
+                   dplyr::select(all_of(excl_names), sex, Time.label, data_type, FI, id, strain) %>%
+                   dplyr::group_by(data_type, Time.label, sex) %>%
+                   mutate_all(~ifelse(is.na(.) == TRUE, median(., na.rm = TRUE), .)) %>%
+                   dplyr::ungroup() %>% as.data.frame() %>%
+                   mutate(sex_bin = ifelse(sex == "F", 1, 0)) %>%
+                   cbind(., val_merged_dat %>% dplyr::select(Mouse.ID, diet, carbo, protein, fat, 
+                                                            fiber, ash, choline, va, vb1, vb2, vb3, vb5, vb6, 
+                                                            vb7, vb9, vb12, vd, ve, vk, facility, age_assess, 
+                                                   time2death, age_death, lifespan_perc, strain)) 
+val_set_keep = val_merge_keep %>%
+  dplyr::select(all_of(colnames(train_set_keep)))
+```
+
+## 3.1 PCA analysis on training set
+```{r}
+## diet PCA
+train_set_diet_df = train_set_keep %>%
+  dplyr::select(carbo, protein, fat, fiber, ash, choline,
+                va, vb1, vb2, vb3, vb5, vb6, vb7, vb9, vb12, vd, ve, vk) 
+diet_pca = prcomp(train_set_diet_df, scale. = TRUE)
+val_set_unique_diet = val_set_keep %>%
+  dplyr::select(carbo, protein, fat, fiber, ash, choline,
+                va, vb1, vb2, vb3, vb5, vb6, vb7, vb9, vb12, vd, ve, vk) 
+val_set_unique_pca = predict(diet_pca, newdata = val_set_unique_diet) %>%
+  as.data.frame() %>%
+  mutate(diet1 = val_set_keep$diet,
+         type = "val") %>%
+  count(PC1, PC2, diet1, type) 
+```
+
+```{r}
+## frailty item PCA
+train_set_keep_pca = train_set_keep[, 1:19]
+train_set_pca_raw = prcomp(train_set_keep_pca, scale. = TRUE)
+```
+
+```{r}
+## association between frailty PCs with covariates
+diet_pca_rename = as.data.frame(diet_pca$x) %>%
+  `colnames<-`(paste0("diet_PC", 1:18))
+train_set_keep_assoc = cbind(cbind(train_set_keep, diet_pca_rename), 
+                             train_set_pca_raw$x[, 1:17]) %>%
+  as.data.frame() 
+train_set_keep_assoc_factor = train_set_keep_assoc %>%
+  dplyr::select(sex, data_type, facility, strain, 
+                paste0("PC", 1:17))
+train_set_keep_assoc_numeric = train_set_keep_assoc %>%
+  dplyr::select(diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6,
+                paste0("PC", 1:17))
+
+p_mat_cat = lapply(1:4, function(x) {
+  p = sapply(5:21, function(y) {
+    lm_res = lm(train_set_keep_assoc_factor[, y] ~ as.factor(train_set_keep_assoc_factor[, x]), 
+                      data = train_set_keep_assoc_factor)
+    return(summary(aov(lm_res))[[1]][1, 5])})}) %>%
+  Reduce(cbind, .) %>%
+  `colnames<-`(c("sex", "cohort", "facility", "strain")) %>%
+  `rownames<-`(paste0("PC", 1:17))
+
+p_mat_cts = lapply(1:6, function(x) {
+  p = sapply(7:23, function(y) {
+    lm_res = lm(train_set_keep_assoc_numeric[, y] ~ as.numeric(train_set_keep_assoc_numeric[, x]), 
+                      data = train_set_keep_assoc_numeric)
+    return(summary(aov(lm_res))[[1]][1, 5])
+  })
+}) %>%
+  Reduce(cbind, .) %>%
+  `colnames<-`(c("diet_PC1", "diet_PC2", "diet_PC3", "diet_PC4", "diet_PC5", "diet_PC6")) %>%
+  `rownames<-`(paste0("PC", 1:17))
+
+max_logp = 25
+p_mat = cbind(p_mat_cat, p_mat_cts) %>% t() %>% as.data.frame() %>%
+  mutate(across(matches("PC"), ~ {adj <- p.adjust(., method = "BH")
+      -log10(pmax(adj, 10^(-max_logp)))
+    }
+  )) %>% as.matrix()
+```
+
+```{r}
+## partioning variance analysis
+pc_matrix = train_set_pca_raw$x[, 1:17] %>% t() %>% as.data.frame()
+colnames(pc_matrix) = train_set_keep$Mouse.ID
+train_set_keep_meta = cbind(train_set_keep, diet_pca_rename) %>%
+  mutate(strain = as.factor(strain),
+         mouse_id = as.factor(Mouse.ID))
+var_partition_res = fitExtractVarPartModel(pc_matrix, 
+                                           ~ (1|strain) + sex_bin + diet_PC1 + diet_PC2 + diet_PC3 + diet_PC4 + diet_PC5 + diet_PC6 + (1|mouse_id),
+                                           train_set_keep_meta)
+var_partition_visual_tbl = rbind(sapply(1:9, function(x) sum(summary(train_set_pca_raw)$importance[2, 1:17]*var_partition_res[, x])),
+                                 var_partition_res[1:6, 1:9]) %>% 
+  as.data.frame()
+```
+
+# 4. mixed-strain age clock 
+```{r}
+## feature importance
+curr_age_train_all = cbind(train_set_keep, diet_pca_rename) %>%
+  `rownames<-`(.$id) %>%
+  dplyr::select(age_assess, sex_bin, strain, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6,
+                             all_of(colnames(train_set_keep)[1:19])) 
+curr_age_rf_tune_x = curr_age_train_all[, -1]
+curr_age_rf_tune_y = curr_age_train_all[, 1]
+
+set.seed(2024)
+seeds = sample.int(10000, 50)
+age_model_feature_rank = lapply(seeds, function(x) {
+  set.seed(x)
+  seeds_cv = vector(mode = "list", length = 11)
+  for (i in 1:10) seeds_cv[[i]] = sample.int(10000, 15)
+  seeds_cv[[11]] = sample.int(100, 1)
+  repeatedcv = trainControl(method = "repeatedcv", 
+                              number = 10,
+                              seeds = seeds_cv)
+  rf_tuning = caret::train(x = curr_age_rf_tune_x,
+                           y = curr_age_rf_tune_y,
+                           data = curr_age_train_all,
+                           method = "rf",
+                           trControl = repeatedcv,
+                           metric = "RMSE", 
+                           nodesize = 10,
+                           ntree = 1000,
+                           importance = TRUE,
+                           tuneGrid = expand.grid(.mtry = c(1:15)))
+  return(varImp(rf_tuning, scale = FALSE))
+})
+```
+
+```{r}
+## function to run rf models
+## training set CV mean derived from the model
+## apply to test set for performance metrics
+rf_model_cv_tune = function(dat_tbl) {
+  set.seed(2024)
+  seeds_cv = vector(mode = "list", length = 501)
+  for (i in 1:500) seeds_cv[[i]] = sample.int(10000, 15)
+  seeds_cv[[501]] = sample.int(10000, 1)
+  repeatedcv = trainControl(method = "repeatedcv", 
+                            number = 10,
+                            repeats = 50, 
+                            seeds = seeds_cv, 
+                            savePredictions = "final")
+  train_y = dat_tbl[, 1]
+  train_x = dat_tbl[, -1]
+  rf_tuning = caret::train(x = train_x,
+                           y = train_y,
+                           data = dat_tbl,
+                           method = "rf",
+                           trControl = repeatedcv,
+                           metric = "RMSE", 
+                           nodesize = 10,
+                           ntree = 1000, 
+                           tuneGrid = expand.grid(.mtry = c(1:15)))
+  rf_model = randomForest(x = train_x,
+                          y = train_y,
+                          data = dat_tbl, nodesize = 10, ntree = 1000, mtry = rf_tuning$bestTune[[1]], 
+                          na.action = na.omit)
+  return(list(rf_tuning, rf_model))
+}
+
+fi_19 = colnames(train_set_keep)[1:19]
+train_fi19 = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19))
+train_fi19_sex = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), sex_bin)
+train_fi19_diet = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
+train_fi19_strain = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), strain)
+train_fi19_sex_diet = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
+train_fi19_sex_strain = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), sex_bin, strain)
+train_fi19_diet_strain = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6, strain)
+train_fi19_sex_diet_strain = curr_age_train_all %>%
+  dplyr::select(age_assess, all_of(fi_19), sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6, strain)
+
+rf_model_cv_tune_fi19_lst = lapply(list(train_fi19, train_fi19_sex, train_fi19_diet, 
+                                        train_fi19_strain, train_fi19_sex_diet, 
+                                        train_fi19_sex_strain, train_fi19_diet_strain, train_fi19_sex_diet_strain),
+                                   function(x) rf_model_cv_tune(x))
+```
+
+```{r}
+## feature ranking in subgroups
+fea_rank_fn = function(df) {
+  curr_age_rf_tune_x = df[, -1]
+  curr_age_rf_tune_y = df[, 1]
+  set.seed(2024)
+  seeds = sample.int(10000, 50)
+  age_model_feature_rank = lapply(seeds, function(x) {
+    set.seed(x)
+    seeds_cv = vector(mode = "list", length = 11)
+    for (i in 1:10) seeds_cv[[i]] = sample.int(10000, 15)
+    seeds_cv[[11]] = sample.int(10000, 1)
+    repeatedcv = trainControl(method = "cv", 
+                              number = 10,
+                              seeds = seeds_cv)
+    rf_tuning = caret::train(x = curr_age_rf_tune_x,
+                             y = curr_age_rf_tune_y,
+                             data = df,
+                             method = "rf",
+                             trControl = repeatedcv,
+                             metric = "RMSE",
+                             nodesize = 10,
+                             ntree = 1000,
+                             importance = TRUE,
+                             tuneGrid = expand.grid(.mtry = c(1:15)))
+    return(varImp(rf_tuning, scale = FALSE))})
+  return(age_model_feature_rank)
+} 
+
+b6_dat_female = curr_age_train_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  filter(sex_bin == "1") %>%
+  dplyr::select(age_assess, all_of(fi_19), diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
+b6_dat_male = curr_age_train_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  filter(sex_bin == "0") %>%
+  dplyr::select(age_assess, all_of(fi_19), diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
+het3_dat_female = curr_age_train_all %>% 
+  filter(strain == "het3") %>%
+  filter(sex_bin == "1") %>%
+  dplyr::select(age_assess, all_of(fi_19), diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6) 
+het3_dat_male = curr_age_train_all %>% 
+  filter(strain == "het3") %>%
+  filter(sex_bin == "0") %>%
+  dplyr::select(age_assess, all_of(fi_19), diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6) 
+
+b6_female_age_fea_rank = fea_rank_fn(b6_dat_female)
+b6_male_age_fea_rank = fea_rank_fn(b6_dat_male)
+het3_female_age_fea_rank = fea_rank_fn(het3_dat_female)
+het3_male_age_fea_rank = fea_rank_fn(het3_dat_male)
+
+## subgroup models
+curr_age_strainsex_models = lapply(list(b6_dat_female, b6_dat_male,
+                                        het3_dat_female, het3_dat_male), function(x) {
+                                          res = rf_model_cv_tune(x)
+                                          return(res)})
+```
+
+```{r}
+## age group stratification
+b6_dat_female_b540 = curr_age_train_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  filter(sex_bin == "1") %>%
+  filter(age_assess <= 540) %>%
+  dplyr::select(all_of(colnames(b6_dat_female)))
+
+b6_dat_female_o540 = curr_age_train_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  filter(sex_bin == "1") %>%
+  filter(age_assess > 540) %>%
+  dplyr::select(all_of(colnames(b6_dat_female)))
+
+b6_dat_male_b540 = curr_age_train_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  filter(sex_bin == "0") %>%
+  filter(age_assess <= 540) %>%
+  dplyr::select(all_of(colnames(b6_dat_male)))
+
+b6_dat_male_o540 = curr_age_train_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  filter(sex_bin == "0") %>%
+  filter(age_assess > 540) %>%
+  dplyr::select(all_of(colnames(b6_dat_male)))
+
+het3_dat_female_b540 = curr_age_train_all %>% 
+  filter(strain == "het3") %>% 
+  filter(sex_bin == "1") %>%
+  filter(age_assess <= 540) %>%
+  dplyr::select(all_of(colnames(het3_dat_female)))
+
+het3_dat_female_o540 = curr_age_train_all %>% 
+  filter(strain == "het3") %>% 
+  filter(sex_bin == "1") %>%
+  filter(age_assess > 540) %>%
+  dplyr::select(all_of(colnames(het3_dat_female)))
+
+het3_dat_male_b540 = curr_age_train_all %>% 
+  filter(strain == "het3") %>% 
+  filter(sex_bin == "0") %>%
+  filter(age_assess <= 540) %>%
+  dplyr::select(all_of(colnames(het3_dat_male)))
+
+het3_dat_male_o540 = curr_age_train_all %>% 
+  filter(strain == "het3") %>% 
+  filter(sex_bin == "0") %>%
+  filter(age_assess > 540) %>%
+  dplyr::select(all_of(colnames(het3_dat_male)))
+
+curr_age_b6_f_b540_model = rf_model_cv_tune(b6_dat_female_b540)
+curr_age_b6_m_b540_model = rf_model_cv_tune(b6_dat_male_b540)
+curr_age_b6_f_o540_model = rf_model_cv_tune(b6_dat_female_o540)
+curr_age_b6_m_o540_model = rf_model_cv_tune(b6_dat_male_o540)
+curr_age_het3_f_b540_model = rf_model_cv_tune(het3_dat_female_b540)
+curr_age_het3_m_b540_model = rf_model_cv_tune(het3_dat_male_b540)
+curr_age_het3_f_o540_model = rf_model_cv_tune(het3_dat_female_o540)
+curr_age_het3_m_o540_model = rf_model_cv_tune(het3_dat_male_o540)
+
+curr_age_strainsexage_model = list(curr_age_b6_f_b540_model, curr_age_b6_m_b540_model, 
+                                   curr_age_b6_f_o540_model, curr_age_b6_m_o540_model,
+                                   curr_age_het3_f_b540_model, curr_age_het3_m_b540_model, 
+                                   curr_age_het3_f_o540_model, curr_age_het3_m_o540_model)
+curr_age_strainsexage_lst = list(b6_dat_female_b540, b6_dat_male_b540,
+                                 b6_dat_female_o540, b6_dat_male_o540,
+                                 het3_dat_female_b540, het3_dat_male_b540,
+                                 het3_dat_female_o540, het3_dat_male_o540)
+```
+
+
+```{r}
+age_strainsexage_model_selection = function(strain, sex_bin, age) {
+  if (strain == "c57") {
+    if (sex_bin == "1") {
+      if (age <= 540) {
+        model = curr_age_b6_f_b540_model[[2]]
+      } else {
+        model = curr_age_b6_f_o540_model[[2]]
+      }
+    } else {
+      if (age <= 540) {
+        model = curr_age_b6_m_b540_model[[2]]
+      } else {
+        model = curr_age_b6_m_o540_model[[2]]
+      }
+    }
+  } else {
+    if (sex_bin == "1") {
+      if (age <= 540) {
+        model = curr_age_het3_f_b540_model[[2]]
+      } else {
+        model = curr_age_het3_f_o540_model[[2]]
+      }
+    } else {
+      if (age <= 540) {
+        model = curr_age_het3_m_b540_model[[2]]
+      } else {
+        model = curr_age_het3_m_o540_model[[2]]
+      }
+    }
+  }
+  return(model)
+}
+
+```
+
+# 5. remaining lifespan percentage model 
+```{r}
+## remaining lifespan feature importance
+perc_train_all = cbind(train_set_keep, diet_pca_rename) %>%
+  filter(time2death >= 0) %>%
+  mutate(remain_perc = time2death/age_death) %>%
+               `rownames<-`(.$id) %>%
+               dplyr::select(remain_perc, age_assess, sex_bin, strain, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6,
+                             all_of(colnames(train_set_keep)[1:19])) 
+perc_rf_tune_x = perc_train_all[, -1]
+perc_rf_tune_y = perc_train_all[, 1]
+
+set.seed(2024)
+seeds = sample.int(10000, 50)
+perc_model_feature_rank = lapply(seeds, function(x) {
+  set.seed(x)
+  seeds_cv = vector(mode = "list", length = 11)
+  for (i in 1:10) seeds_cv[[i]] = sample.int(10000, 15)
+  seeds_cv[[11]] = sample.int(10000, 1)
+  repeatedcv = trainControl(method = "cv", 
+                              number = 10,
+                              seeds = seeds_cv)
+  rf_tuning = caret::train(x = perc_rf_tune_x,
+                           y = perc_rf_tune_y,
+                           data = perc_train_all,
+                           method = "rf",
+                           trControl = repeatedcv,
+                           metric = "RMSE",
+                           nodesize = 50,
+                           ntree = 1000,
+                           importance = TRUE,
+                           tuneGrid = expand.grid(.mtry = c(1:15)))
+  return(varImp(rf_tuning, scale = FALSE))
+})
+```
+
+```{r}
+perc_fi19 = colnames(train_set_keep)[1:19]
+
+train_perc_fi19 = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19))
+train_perc_fi19_age = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), age_assess)
+train_perc_fi19_sex = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), sex_bin)
+train_perc_fi19_age_sex = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), age_assess, sex_bin)
+train_perc_fi19_age_sex_diet = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), age_assess, sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
+train_perc_fi19_age_strain = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), age_assess, strain)
+train_perc_fi19_sex_strain = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), sex_bin, strain)
+train_perc_fi19_age_sex_strain = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), age_assess, sex_bin, strain)
+train_perc_fi19_age_sex_diet_strain = perc_train_all  %>% 
+  dplyr::select(remain_perc, all_of(perc_fi19), age_assess, sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6, strain)
+
+## rf model for lifespan 
+rf_model_cv_tune_perc = function(dat_tbl) {
+  set.seed(2024)
+  seeds_cv = vector(mode = "list", length = 501)
+  for (i in 1:500) seeds_cv[[i]] = sample.int(10000, 15)
+  seeds_cv[[501]] = sample.int(10000, 1)
+  repeatedcv = trainControl(method = "repeatedcv", 
+                            number = 10,
+                            repeats = 50, 
+                            seeds = seeds_cv, 
+                            savePredictions = "final")
+  train_y = dat_tbl[, 1]
+  train_x = dat_tbl[, -1, drop = FALSE]
+  rf_tuning = caret::train(x = train_x,
+                           y = train_y,
+                           data = dat_tbl,
+                           method = "rf",
+                           trControl = repeatedcv,
+                           metric = "RMSE", 
+                           nodesize = 50,
+                           ntree = 1000, 
+                           tuneGrid = expand.grid(.mtry = c(1:15)))
+  rf_model = randomForest(x = train_x,
+                          y = train_y,
+                          data = dat_tbl, nodesize = 50,
+                          ntree = 1000, mtry = rf_tuning$bestTune[[1]], 
+                          na.action = na.omit)
+  return(list(rf_tuning, rf_model))
+}
+
+perc_model_cv_tune_fi19_lst = lapply(list(train_perc_fi19, train_perc_fi19_age, train_perc_fi19_sex, train_perc_fi19_age_sex,
+                                         train_perc_fi19_age_sex_diet, 
+                                         train_perc_fi19_age_strain, train_perc_fi19_sex_strain, train_perc_fi19_age_sex_strain,
+                                         train_perc_fi19_age_sex_diet_strain),
+                                    function(x) rf_model_cv_tune_perc(x))
+```
+
+```{r}
+## subgroup models feature ranking
+b6_perc_dat = perc_train_keep_all %>% 
+  filter(strain %in% c("JNIA", "N", "J")) %>%
+  dplyr::select(all_of(colnames(train_perc_fi19_age_sex_diet)))
+b6_perc_dat_female = b6_perc_dat %>% filter(sex_bin == "1") %>% dplyr::select(-sex_bin)
+b6_perc_dat_male = b6_perc_dat %>% filter(sex_bin == "0") %>% dplyr::select(-sex_bin)
+
+het3_perc_dat = perc_train_keep_all %>% filter(strain == "het3") %>%
+  dplyr::select(all_of(colnames(train_perc_fi19_age_sex_diet)))
+het3_perc_dat_female = het3_perc_dat %>% filter(sex_bin == "1") %>% dplyr::select(-sex_bin)
+het3_perc_dat_male = het3_perc_dat %>% filter(sex_bin == "0") %>% dplyr::select(-sex_bin)
+
+fea_rank_fn_perc = function(df) {
+  curr_age_rf_tune_x = df[, -1]
+  curr_age_rf_tune_y = df[, 1]
+  set.seed(2024)
+  seeds = sample.int(10000, 50)
+  age_model_feature_rank = lapply(seeds, function(x) {
+    set.seed(x)
+    seeds_cv = vector(mode = "list", length = 11)
+    for (i in 1:10) seeds_cv[[i]] = sample.int(10000, 15)
+    seeds_cv[[11]] = sample.int(10000, 1)
+    repeatedcv = trainControl(method = "cv", 
+                              number = 10,
+                              seeds = seeds_cv)
+    rf_tuning = caret::train(x = curr_age_rf_tune_x,
+                             y = curr_age_rf_tune_y,
+                             data = df,
+                             method = "rf",
+                             trControl = repeatedcv,
+                             metric = "RMSE",
+                             nodesize = 50,
+                             ntree = 1000,
+                             importance = TRUE,
+                             tuneGrid = expand.grid(.mtry = c(1:15)))
+    return(varImp(rf_tuning, scale = FALSE))})
+  return(age_model_feature_rank)
+} 
+
+b6_perc_female_fea_rank = fea_rank_fn_perc(b6_perc_dat_female)
+b6_perc_male_fea_rank = fea_rank_fn_perc(b6_perc_dat_male)
+het3_perc_female_fea_rank = fea_rank_fn_perc(het3_perc_dat_female)
+het3_perc_male_fea_rank = fea_rank_fn_perc(het3_perc_dat_male)
+
+b6_perc_female_model = rf_model_cv_tune_perc(b6_perc_dat_female)
+b6_perc_male_model = rf_model_cv_tune_perc(b6_perc_dat_male)
+het3_perc_female_model = rf_model_cv_tune_perc(het3_perc_dat_female)
+het3_perc_male_model = rf_model_cv_tune_perc(het3_perc_dat_male)
+```
+
+```{r}
+perc_strainsex_model_selection = function(strain, sex) {
+    if (strain %in% c("JNIA", "J", "N")) {
+      if (sex == "1") {
+        model = b6_perc_female_model[[2]]
+      } else {
+        model = b6_perc_male_model[[2]]
+      }
+    } else {
+      if (sex == "1") {
+        model = het3_perc_female_model[[2]]
+      } else {
+        model = het3_perc_male_model[[2]]
+      }
+    }
+  return(model)
+}
+```
+
+# 6. DO mice transfer cohort age model
+```{r}
+## DO mice models
+trans_train_diet = predict(diet_pca, trans_train_set %>% 
+                             dplyr::select(carbo, protein, fat, fiber, ash, choline,
+                va, vb1, vb2, vb3, vb5, vb6, vb7, vb9, vb12, vd, ve, vk)) %>%
+  `colnames<-`(paste0("diet_PC", 1:18))
+trans_train_comb = cbind(trans_train_set_fillna, trans_train_diet) %>%
+  `rownames<-`(.$id) %>%
+  mutate(age_assess = trans_train_set$age_assess) %>%
+  dplyr::select(colnames(train_fi19_sex_diet))
+
+trans_train_model = rf_model_cv_tune(trans_train_comb)
+trans_train_comb_female = trans_train_comb %>% filter(sex_bin == "1") %>% dplyr::select(-sex_bin)
+trans_train_comb_male = trans_train_comb %>% filter(sex_bin == "0") %>% dplyr::select(-sex_bin)
+trans_female_rank = fea_rank_fn(trans_train_comb_female)
+trans_male_rank = fea_rank_fn(trans_train_comb_male)
+trans_female_model = rf_model_cv_tune(trans_train_comb_female)
+trans_male_model = rf_model_cv_tune(trans_train_comb_male)
+trans_train_female_o540 = trans_train_comb_female %>% filter(age_assess > 540)
+trans_train_female_b540 = trans_train_comb_female %>% filter(age_assess <= 540)
+trans_train_male_o540 = trans_train_comb_male %>% filter(age_assess > 540)
+trans_train_male_b540 = trans_train_comb_male %>% filter(age_assess <= 540)
+trans_sex_agegroup_models = lapply(list(trans_train_female_o540, trans_train_female_b540,
+                                        trans_train_male_o540, trans_train_male_b540), function(x) {
+                                          model = rf_model_cv_tune(x)
+                                          return(model)})
+```
+
+# 7. intervention and association of FI item in intervention
+```{r, message = FALSE, warning = FALSE}
+## FI item associations with outcomes, stratified by strain, comparing to interventions
+age_c57_assoc_dat = cbind(train_set_keep, diet_pca_rename) %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  mutate(type = "train") %>%
+  dplyr::select(excl_names, id, Mouse.ID, sex_bin, paste0("diet_PC", 1:6), age_assess, time2death, age_death, strain, type)
+
+age_INT_dataset_diet = predict(diet_pca, val_set_keep %>% 
+                            dplyr::select(carbo, protein, fat, fiber, ash, choline,
+                va, vb1, vb2, vb3, vb5, vb6, vb7, vb9, vb12, vd, ve, vk)) %>%
+        `colnames<-`(paste0("diet_PC", 1:18))
+age_INT_dataset_all = cbind(val_set_keep, age_INT_dataset_diet) %>% as.data.frame() %>% filter(data_type != "J_V3_I")
+
+age_INT_c57_assoc_dat = age_INT_dataset_all %>%
+  filter(strain %in% c("J", "JNIA", "N")) %>%
+  mutate(type = "int") %>%
+  dplyr::select(all_of(colnames(age_c57_assoc_dat)))
+
+age_c57_assoc_contvsint = rbind(age_c57_assoc_dat, age_INT_c57_assoc_dat) %>%
+  as.data.frame() %>%
+  mutate(age_scale = as.numeric(scale(age_assess)))
+
+age_assoc_comp_sig = sapply(1:19, function(x) {
+    lmer_res = lmer(age_scale ~ age_c57_assoc_contvsint[, x]*type + as.factor(sex_bin) + diet_PC1 + diet_PC2 + diet_PC3 + diet_PC4 + diet_PC5 + diet_PC6 + (1 | Mouse.ID),
+                    data = age_c57_assoc_contvsint)
+    coef = summary(lmer_res)$coefficients
+    return(coef["age_c57_assoc_contvsint[, x]:typetrain", 5])
+})
+
+## interaction to determine sig
+perc_c57_assoc_contvsint = age_c57_assoc_contvsint %>%
+  filter(time2death >= 0) %>%
+  mutate(remain_perc = time2death/age_death) %>%
+  dplyr::select(excl_names, id, Mouse.ID, sex_bin, paste0("diet_PC", 1:6), strain, type, age_scale, remain_perc)
+
+perc_assoc_comp_sig = sapply(1:19, function(x) {
+      lmer_res = lmer(remain_perc ~ perc_c57_assoc_contvsint[, x]*type + age_scale + (1 | Mouse.ID), data = perc_c57_assoc_contvsint)
+      coef = summary(lmer_res)$coefficients
+    return(coef["perc_c57_assoc_contvsint[, x]:typetrain", 5])})
+```
+
+```{r}
+FIAS_model_selection = function(age, sex, strain) {
+  if (strain %in% c("JNIA", "J", "N")) {
+    if (sex == "F") {
+      if (age > 540) {model = curr_age_b6_f_o540_model[[2]]} else 
+        {model = curr_age_b6_f_b540_model[[2]]}
+    } else {
+      if (age > 540) {model = curr_age_b6_m_o540_model[[2]]} else 
+        {model = curr_age_b6_m_b540_model[[2]]}
+    }
+  } else if (strain == "het3") {
+    if (sex == "F") {
+      if (age > 540) {model = curr_age_het3_f_o540_model[[2]]} else 
+      {model = curr_age_het3_f_b540_model[[2]]}
+    } else {
+      if (age > 540) {model = curr_age_het3_m_o540_model[[2]]} else 
+      {model = curr_age_het3_m_b540_model[[2]]}
+    }
+  } else if (strain == "DO") {
+    model = trans_train_model[[2]]
+  } else { ## if strain not included in the above three
+    model = rf_model_cv_tune_fi19_lst[[5]][[2]]
+  } 
+  return (model)
+}
+```
+
+```{r}
+FIRLS_model_selection = function(strain) {
+  if (strain == "DO") {
+    model = perc_trans_train_model[[2]]
+  } else {
+    model = perc_model_cv_tune_fi19_lst[[5]][[2]]
+  }
+  return (model)
+}
+```
+
+```{r}
+sessionInfo()
+```
+
