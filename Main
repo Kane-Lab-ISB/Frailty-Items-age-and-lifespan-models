@@ -1,0 +1,3 @@
+Rmd file to analysis mouse frailty data and build FIRS/FIRLS 
+merged_data_061926.RData includes all 28 datasets used in the manuscript
+FIAS_FIRLS_models.RData contains models ready to use. please see README
