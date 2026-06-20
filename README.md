@@ -5,11 +5,13 @@ Both FIAS and FIRLS models need Diet PC1-6 derived from diet_pca
 age_assess, age (days) at assessment of frailty 
 
 sex_bin, Female, "1"; Male, "0"
+sex, "F" or "M"
+strain, "c57", "het3", "DO"
 
 ## example to get diet PCs  
   ```r
   library(dplyr)
-  diet_df = diet_factors %>% # example to get diet PC1-6
+  diet_df = FI_item_data %>% # example to get diet PC1-6
     dplyr::select(carbo, protein, fat, fiber, ash, choline, va, 
                   vb1, vb2, vb3, vb5, vb6, vb7, vb9, vb12, vd, ve, vk) # need 18 factors from the nutrient factor of the diet
   diet_pcas = predict(diet_pca, newdata = diet_df) %>%
@@ -24,7 +26,7 @@ sex_bin, Female, "1"; Male, "0"
     dat_for_fias = fi_df[x, ] %>%
       dplyr::select(age_assess, Alopecia, Loss_of_fur_colour, Loss_of_whiskers, Coat_condition, Tumours, Distended_abdomen, Kyphosis,
       Tail_stiffening, Gait_disorders, Tremor, Forelimb_grip_strength, Body_condition_score, Vestibular_disturbance, Eye_discharge_swelling,
-      Microphthalmia, Vision_loss, Menace_reflex, Breathing_rate_depth, Piloerection, sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)              "diet_PC6")
+      Microphthalmia, Vision_loss, Menace_reflex, Breathing_rate_depth, Piloerection, sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
     age = FI_item_data[x, ]$age_assess
     sex = FI_item_data[x, ]$sex
     strain = FI_item_data[x, ]$strain
@@ -38,7 +40,7 @@ sex_bin, Female, "1"; Male, "0"
     dat_for_firls = fi_df[x, ] %>%
       dplyr::select(Alopecia, Loss_of_fur_colour, Loss_of_whiskers, Coat_condition, Tumours, Distended_abdomen, Kyphosis,
       Tail_stiffening, Gait_disorders, Tremor, Forelimb_grip_strength, Body_condition_score, Vestibular_disturbance, Eye_discharge_swelling,
-      Microphthalmia, Vision_loss, Menace_reflex, Breathing_rate_depth, Piloerection, age_assess, sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)              "diet_PC6")
+      Microphthalmia, Vision_loss, Menace_reflex, Breathing_rate_depth, Piloerection, age_assess, sex_bin, diet_PC1, diet_PC2, diet_PC3, diet_PC4, diet_PC5, diet_PC6)
     strain = FI_item_data[x, ]$strain
     model = FIRLS_model_selection(strain)
     firls = predict(model, dat_for_firls)
