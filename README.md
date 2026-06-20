@@ -1,6 +1,9 @@
-The FIAS_FIRLS_models.RData contains three functions, FIAS_model_selection, FIRLS_model_selection, diet_pca and example dataframes, diet_factors and FI_item_data 
-Both FIAS and FIRLS models need Diet PC1-6 derived from diet_pca 
+The FIAS_FIRLS_models.RData contains three functions, FIAS_model_selection, FIRLS_model_selection, diet_pca and an example dataframe, FI_item_data. 
+
+Both FIAS and FIRLS models need Diet PC1-6 derived from diet_pca
+
 age_assess, age (days) at assessment of frailty 
+
 sex_bin, Female, "1"; Male, "0"
 
 ## example to get diet PCs  
